@@ -198,7 +198,6 @@ export default class AntigravityTrackerExtension extends Extension {
         this._quotaData = null;
         this._timerId = 0;
         this._discoveryTimerId = 0;
-        this._launchTimerId = 0;
         this._isDiscovering = false;
         this._groupWidgets = [];
 
@@ -237,11 +236,6 @@ export default class AntigravityTrackerExtension extends Extension {
             this._discoveryTimerId = 0;
         }
 
-        if (this._launchTimerId) {
-            GLib.source_remove(this._launchTimerId);
-            this._launchTimerId = 0;
-        }
-
         if (this._cancellable) {
             this._cancellable.cancel();
             this._cancellable = null;
@@ -274,7 +268,6 @@ export default class AntigravityTrackerExtension extends Extension {
         this._lastUpdateLabel = null;
         this._startDaemonItem = null;
         this._stopDaemonItem = null;
-        this._launchAppItem = null;
     }
 
     // ── Menu Construction ────────────────────────────────────────────────
@@ -316,27 +309,6 @@ export default class AntigravityTrackerExtension extends Extension {
         this._startDaemonItem.connect('activate', () => this._startDaemon());
         this._startDaemonItem.visible = false;
         menu.addMenuItem(this._startDaemonItem);
-
-        // "Launch Desktop App" action (optional secondary launcher)
-        this._launchAppItem = new PopupMenu.PopupBaseMenuItem({
-            reactive: true,
-            can_focus: true,
-        });
-        this._launchAppItem.add_style_class_name('agt-launch-item');
-        const appBox = new St.BoxLayout({
-            x_expand: true,
-            x_align: Clutter.ActorAlign.CENTER,
-        });
-        const appIcon = new St.Label({text: '🚀'});
-        appIcon.set_style('margin-right: 8px;');
-        appBox.add_child(appIcon);
-        const appLabel = new St.Label({text: 'Launch Desktop App'});
-        appLabel.add_style_class_name('agt-launch-label');
-        appBox.add_child(appLabel);
-        this._launchAppItem.add_child(appBox);
-        this._launchAppItem.connect('activate', () => this._launchAntigravity());
-        this._launchAppItem.visible = false;
-        menu.addMenuItem(this._launchAppItem);
 
         // Scrollable section for quota groups
         this._quotaSection = new PopupMenu.PopupMenuSection();
@@ -532,7 +504,7 @@ export default class AntigravityTrackerExtension extends Extension {
      * Falls back to a full rebuild if the structure has changed.
      */
     _updateQuotaDisplay(data) {
-        if (!data?.groups) return;
+        if (!data?.groups || !this._indicator || this._cancellable?.is_cancelled()) return;
 
         // Check if structure changed (different number of groups or buckets)
         const structureMatch = this._groupWidgets.length === data.groups.length
@@ -568,7 +540,6 @@ export default class AntigravityTrackerExtension extends Extension {
 
     _updateMenuState() {
         const isConnected = !!(this._serverInfo && this._activePort);
-        const isCli = this._serverInfo?.source === 'cli_daemon';
 
         if (this._statusItem)
             this._statusItem.visible = !isConnected;
@@ -576,15 +547,12 @@ export default class AntigravityTrackerExtension extends Extension {
         if (this._startDaemonItem)
             this._startDaemonItem.visible = !isConnected;
 
-        if (this._launchAppItem)
-            this._launchAppItem.visible = !isConnected && !!this._findAntigravityBinary();
-
         if (this._stopDaemonItem)
-            this._stopDaemonItem.visible = isConnected && isCli;
+            this._stopDaemonItem.visible = isConnected;
 
         if (this._sourceLabel) {
             if (isConnected) {
-                this._sourceLabel.text = isCli ? 'CLI Daemon' : 'Desktop App';
+                this._sourceLabel.text = 'CLI Daemon';
                 this._sourceLabel.visible = true;
             } else {
                 this._sourceLabel.visible = false;
@@ -653,7 +621,6 @@ export default class AntigravityTrackerExtension extends Extension {
         this._statusLabel.text = 'Starting CLI daemon…';
         this._statusItem.visible = true;
         this._startDaemonItem.visible = false;
-        if (this._launchAppItem) this._launchAppItem.visible = false;
 
         const info = await discoverServerAsync(this.path, ['--start'], this._cancellable);
         if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
@@ -758,17 +725,21 @@ export default class AntigravityTrackerExtension extends Extension {
 
         try {
             const data = await this._rpcRequest(this._activePort);
+            if (this._cancellable?.is_cancelled() || !this._indicator) return;
+
             this._quotaData = data;
             this._updateQuotaDisplay(data);
 
             // Update last-refreshed timestamp
-            const now = new Date();
-            this._lastUpdateLabel.text =
-                `Last: ${now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
+            if (this._lastUpdateLabel) {
+                const now = new Date();
+                this._lastUpdateLabel.text =
+                    `Last: ${now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
+            }
             this._updateMenuState();
 
         } catch (e) {
-            if (this._cancellable?.is_cancelled()) return;
+            if (this._cancellable?.is_cancelled() || !this._indicator) return;
 
             console.error(`[AntigravityTracker] Fetch error: ${e.message}`);
 
@@ -776,75 +747,11 @@ export default class AntigravityTrackerExtension extends Extension {
             this._activePort = null;
             this._serverInfo = null;
             this._stopPolling();
-            this._statusLabel.text = 'Connection lost — retrying…';
+            if (this._statusLabel) {
+                this._statusLabel.text = 'Connection lost — retrying…';
+            }
             this._updateMenuState();
             this._scheduleDiscoveryRetry();
-        }
-    }
-
-    // ── Antigravity Launcher ──────────────────────────────────────────────
-
-    /**
-     * Search common locations for an Antigravity executable.
-     * @returns {string|null} Path to executable, or null
-     */
-    _findAntigravityBinary() {
-        const home = GLib.get_home_dir();
-        const candidates = [
-            GLib.build_filenamev([home, 'Programs', 'Antigravity', 'antigravity']),
-            GLib.build_filenamev([home, '.local', 'share', 'antigravity', 'antigravity']),
-            GLib.build_filenamev([home, '.local', 'bin', 'antigravity']),
-            '/usr/bin/antigravity',
-            '/usr/local/bin/antigravity',
-            '/opt/antigravity/antigravity',
-        ];
-
-        const inPath = GLib.find_program_in_path('antigravity');
-        if (inPath) candidates.unshift(inPath);
-
-        for (const path of candidates) {
-            if (path && GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE))
-                return path;
-        }
-        return null;
-    }
-
-    /**
-     * Launch the Antigravity desktop app in the background.
-     */
-    _launchAntigravity() {
-        const binary = this._findAntigravityBinary();
-        if (!binary) {
-            this._statusLabel.text = 'Antigravity binary not found';
-            return;
-        }
-
-        try {
-            const proc = new Gio.Subprocess({
-                argv: [binary],
-                flags: Gio.SubprocessFlags.NONE,
-            });
-            proc.init(null);
-
-            this._statusLabel.text = 'Launching Antigravity…';
-            this._startDaemonItem.visible = false;
-            this._launchAppItem.visible = false;
-
-            if (this._launchTimerId) {
-                GLib.source_remove(this._launchTimerId);
-                this._launchTimerId = 0;
-            }
-
-            this._launchTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 8, () => {
-                this._launchTimerId = 0;
-                if (!this._cancellable?.is_cancelled()) {
-                    this._startDiscovery(false);
-                }
-                return GLib.SOURCE_REMOVE;
-            });
-        } catch (e) {
-            console.error(`[AntigravityTracker] Launch failed: ${e.message}`);
-            this._statusLabel.text = `Launch failed: ${e.message}`;
         }
     }
 

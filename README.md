@@ -17,7 +17,7 @@ A GNOME Shell extension that displays your [Antigravity](https://antigravity.goo
 ## Requirements
 
 - **GNOME Shell 45–50** (Fedora, Ubuntu 24.04+, Debian, Arch, openSUSE)
-- **Google Antigravity CLI** (`agy`) or **Antigravity Desktop App**
+- **Google Antigravity CLI** (`agy`)
 - **Python 3** (standard library only)
 
 ## Installation
@@ -65,7 +65,7 @@ MUTTER_DEBUG_DUMMY_MODE_SPECS=1920x1080 dbus-run-session gnome-shell --nested --
 
 The extension auto-discovers the local language server by:
 
-1. Checking for a running `agy remote-control serve` CLI daemon or desktop app via `/proc`
+1. Checking for a running `agy remote-control serve` CLI daemon via `/proc`
 2. Automatically starting the headless CLI daemon if it is not currently running
 3. Extracting the local listening port and CSRF authentication token from process memory/environment
 4. Querying `RetrieveUserQuotaSummary` over local loopback TLS Connect-RPC (`127.0.0.1`)

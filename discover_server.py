@@ -16,7 +16,7 @@
 
 """
 Server discovery and auto-start helper for Antigravity Tracker GNOME Shell Extension.
-Finds the active Antigravity language server instance (CLI daemon or Desktop app),
+Finds the active Antigravity CLI daemon (agy remote-control serve),
 extracts its listening port and CSRF token, and optionally auto-starts the CLI daemon
 if not running.
 """
@@ -145,40 +145,6 @@ def get_listening_ports(pid: int) -> list[int]:
     return sorted(list(set(ports)))
 
 
-def discover_desktop_app():
-    """Check for Antigravity desktop Electron app (language_server process)."""
-    my_pid = os.getpid()
-    for entry in os.scandir("/proc"):
-        if not entry.is_dir() or not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid == my_pid:
-            continue
-        try:
-            with open(os.path.join(entry.path, "cmdline"), "rb") as f:
-                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-            if "language_server" in cmd and "--csrf_token" in cmd:
-                if "discover_server" in cmd:
-                    continue
-                csrf_match = re.search(r"--csrf_token\s+([a-f0-9-]+)", cmd)
-                if not csrf_match:
-                    continue
-                csrf_token = csrf_match.group(1)
-                ports = get_listening_ports(pid)
-                for port in ports:
-                    if check_rpc(port, csrf_token, timeout=0.5):
-                        res = {
-                            "pid": pid,
-                            "port": port,
-                            "csrfToken": csrf_token,
-                            "source": "desktop_app",
-                        }
-                        save_cache(res)
-                        return res
-        except Exception:
-            continue
-
-    return None
 
 
 def get_cli_daemon_pid() -> int | None:
@@ -441,16 +407,10 @@ def main():
         print(json.dumps(cached))
         return 0
 
-    # 2. Discover or auto-start CLI daemon (preferred by user)
+    # 2. Discover or auto-start CLI daemon
     daemon = discover_cli_daemon(autostart=args.autostart and not args.status_only)
     if daemon:
         print(json.dumps(daemon))
-        return 0
-
-    # 3. Fallback: check desktop app if actively running
-    desktop = discover_desktop_app()
-    if desktop:
-        print(json.dumps(desktop))
         return 0
 
     print(json.dumps(None))
