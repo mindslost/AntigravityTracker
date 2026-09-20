@@ -1,0 +1,95 @@
+/* ──────────────────────────────────────────────────────────────────────────────
+ * Antigravity Tracker — Stylesheet
+ *
+ * Dark theme styling matching the Antigravity UI aesthetic.
+ * GNOME Shell uses a CSS subset powered by St (Shell Toolkit).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* ── Popup menu container ─────────────────────────────────────────────────── */
+
+.agt-status-label {
+    color: #888888;
+    font-size: 11pt;
+    font-style: italic;
+    padding: 16px 12px;
+}
+
+/* ── Launch Antigravity button ────────────────────────────────────────────── */
+
+.agt-launch-item {
+    padding: 8px 12px;
+}
+
+.agt-launch-label {
+    font-size: 11pt;
+    font-weight: bold;
+    color: #4CAF50;
+}
+
+/* ── Group header ─────────────────────────────────────────────────────────── */
+
+.agt-group-header-item {
+    padding: 6px 4px 2px 4px;
+}
+
+.agt-group-header {
+    font-weight: bold;
+    font-size: 11pt;
+    color: #e0e0e0;
+}
+
+.agt-info-icon {
+    color: #666666;
+    font-size: 10pt;
+    margin-left: 6px;
+}
+
+.agt-group-spacer {
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+
+/* ── Bucket rows ──────────────────────────────────────────────────────────── */
+
+.agt-bucket-item {
+    padding: 8px 4px;
+}
+
+.agt-bucket-title {
+    font-weight: bold;
+    font-size: 10pt;
+    color: #e0e0e0;
+}
+
+.agt-bucket-description {
+    font-size: 8pt;
+    color: #888888;
+    margin-top: 3px;
+    /* Constrain width so the description wraps rather than stretching the popup */
+    max-width: 280px;
+}
+
+.agt-bucket-percentage {
+    font-size: 11pt;
+    font-weight: bold;
+    color: #e0e0e0;
+    margin-left: 16px;
+    min-width: 45px;
+}
+
+.agt-bucket-separator .popup-separator-menu-item-separator {
+    margin: 0 8px;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* ── Bottom bar ───────────────────────────────────────────────────────────── */
+
+.agt-refresh-label {
+    color: #bbbbbb;
+    font-size: 10pt;
+}
+
+.agt-last-update {
+    color: #666666;
+    font-size: 9pt;
+}
