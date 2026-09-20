@@ -22,8 +22,8 @@ echo ""
 
 mkdir -p "$BUILD_DIR"
 
-# Ensure executable permissions on helper script
-chmod +x "$PROJECT_DIR/discover_server.py"
+# Ensure helper script has regular non-executable permissions (EGO requirement)
+chmod 644 "$PROJECT_DIR/discover_server.py"
 
 echo "→ Packaging extension with gnome-extensions pack..."
 gnome-extensions pack \

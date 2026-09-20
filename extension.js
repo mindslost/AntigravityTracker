@@ -255,19 +255,47 @@ export default class AntigravityTrackerExtension extends Extension {
             this._indicator = null;
         }
 
+        if (this._statusLabel) {
+            this._statusLabel.destroy();
+            this._statusLabel = null;
+        }
+        if (this._statusItem) {
+            this._statusItem.destroy();
+            this._statusItem = null;
+        }
+        if (this._startDaemonItem) {
+            this._startDaemonItem.destroy();
+            this._startDaemonItem = null;
+        }
+        if (this._quotaSection) {
+            this._quotaSection.destroy();
+            this._quotaSection = null;
+        }
+        if (this._refreshLabel) {
+            this._refreshLabel.destroy();
+            this._refreshLabel = null;
+        }
+        if (this._sourceLabel) {
+            this._sourceLabel.destroy();
+            this._sourceLabel = null;
+        }
+        if (this._lastUpdateLabel) {
+            this._lastUpdateLabel.destroy();
+            this._lastUpdateLabel = null;
+        }
+        if (this._refreshItem) {
+            this._refreshItem.destroy();
+            this._refreshItem = null;
+        }
+        if (this._stopDaemonItem) {
+            this._stopDaemonItem.destroy();
+            this._stopDaemonItem = null;
+        }
+
         this._groupWidgets = [];
         this._quotaData = null;
         this._serverInfo = null;
         this._activePort = null;
-        this._statusItem = null;
-        this._statusLabel = null;
-        this._quotaSection = null;
-        this._refreshItem = null;
-        this._refreshLabel = null;
-        this._sourceLabel = null;
-        this._lastUpdateLabel = null;
-        this._startDaemonItem = null;
-        this._stopDaemonItem = null;
     }
 
     // ── Menu Construction ────────────────────────────────────────────────
@@ -688,33 +716,38 @@ export default class AntigravityTrackerExtension extends Extension {
         const message = Soup.Message.new('POST', url);
 
         // Accept the language server's self-signed TLS certificate
-        message.connect('accept-certificate', () => true);
+        const certId = message.connect('accept-certificate', () => true);
 
-        // Connect-RPC headers
-        message.request_headers.append('Content-Type', 'application/json');
-        message.request_headers.append('Connect-Protocol-Version', '1');
-        message.request_headers.append(
-            'X-Codeium-Csrf-Token', this._serverInfo.csrfToken
-        );
+        try {
+            // Connect-RPC headers
+            message.request_headers.append('Content-Type', 'application/json');
+            message.request_headers.append('Connect-Protocol-Version', '1');
+            message.request_headers.append(
+                'X-Codeium-Csrf-Token', this._serverInfo.csrfToken
+            );
 
-        // Empty JSON body
-        message.set_request_body_from_bytes(
-            'application/json',
-            new GLib.Bytes(new TextEncoder().encode('{}'))
-        );
+            // Empty JSON body
+            message.set_request_body_from_bytes(
+                'application/json',
+                new GLib.Bytes(new TextEncoder().encode('{}'))
+            );
 
-        const bytes = await this._httpSession.send_and_read_async(
-            message, GLib.PRIORITY_DEFAULT, this._cancellable
-        );
+            const bytes = await this._httpSession.send_and_read_async(
+                message, GLib.PRIORITY_DEFAULT, this._cancellable
+            );
 
-        if (message.get_status() !== Soup.Status.OK)
-            throw new Error(`HTTP ${message.get_status()}`);
+            if (message.get_status() !== Soup.Status.OK)
+                throw new Error(`HTTP ${message.get_status()}`);
 
-        const text = new TextDecoder().decode(bytes.get_data());
-        const json = JSON.parse(text);
+            const text = new TextDecoder().decode(bytes.get_data());
+            const json = JSON.parse(text);
 
-        // The API wraps data in a "response" envelope
-        return json.response || json;
+            // The API wraps data in a "response" envelope
+            return json.response || json;
+        } finally {
+            if (certId)
+                message.disconnect(certId);
+        }
     }
 
     async _fetchQuota() {
