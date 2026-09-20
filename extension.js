@@ -111,44 +111,60 @@ class CircularProgress extends St.DrawingArea {
 // ─── Server Auto-Discovery ───────────────────────────────────────────────────
 
 /**
- * Scans running processes for an Antigravity `language_server` instance,
- * extracts its CSRF token and listening TCP ports.
- *
- * @returns {{csrfToken: string, ports: number[], pid: number}|null}
+ * Executes a subprocess asynchronously, returning {stdout, stderr, success}.
  */
-function discoverServer() {
+function runCommandAsync(argv, cancellable = null) {
+    return new Promise((resolve, reject) => {
+        try {
+            const proc = new Gio.Subprocess({
+                argv,
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            });
+            proc.init(cancellable);
+            proc.communicate_utf8_async(null, cancellable, (p, res) => {
+                try {
+                    const [ok, stdout, stderr] = p.communicate_utf8_finish(res);
+                    resolve({
+                        stdout: stdout || '',
+                        stderr: stderr || '',
+                        success: ok && p.get_successful(),
+                    });
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+/**
+ * Discovers the active server (or starts the CLI daemon) via discover_server.py.
+ *
+ * @param {string} extensionPath - Path to extension directory
+ * @param {string[]} [extraArgs] - Optional flags like ['--start'] or ['--stop']
+ * @param {Gio.Cancellable} [cancellable]
+ * @returns {Promise<{csrfToken: string, ports: number[], pid: number, source: string}|null>}
+ */
+async function discoverServerAsync(extensionPath, extraArgs = [], cancellable = null) {
     try {
-        // Step 1 — Find the language_server process and its CSRF token
-        const [ok, stdout] = GLib.spawn_command_line_sync(
-            '/bin/bash -c "ps -eo pid,args 2>/dev/null | grep language_server | grep csrf_token | grep -v grep"'
-        );
-        if (!ok) return null;
+        const scriptPath = GLib.build_filenamev([extensionPath, 'discover_server.py']);
+        const res = await runCommandAsync(['/usr/bin/python3', scriptPath, ...extraArgs], cancellable);
+        if (!res.success) return null;
 
-        const output = new TextDecoder().decode(stdout).trim();
-        if (!output) return null;
+        const text = res.stdout.trim();
+        if (!text || text === 'null') return null;
 
-        const csrfMatch = output.match(/--csrf_token\s+(\S+)/);
-        if (!csrfMatch) return null;
-        const csrfToken = csrfMatch[1];
+        const info = JSON.parse(text);
+        if (!info || !info.port || !info.csrfToken) return null;
 
-        const pidMatch = output.match(/^\s*(\d+)/m);
-        if (!pidMatch) return null;
-        const pid = parseInt(pidMatch[1]);
-
-        // Step 2 — Find loopback listening ports for this PID
-        const [ok2, stdout2] = GLib.spawn_command_line_sync(
-            `/bin/bash -c "ss -tlnp 2>/dev/null | grep 'pid=${pid},'"`
-        );
-        if (!ok2) return null;
-
-        const portOutput = new TextDecoder().decode(stdout2);
-        const ports = [...portOutput.matchAll(/127\.0\.0\.1:(\d+)/g)]
-            .map(m => parseInt(m[1]))
-            .filter(p => p > 1024);
-
-        if (ports.length === 0) return null;
-
-        return {csrfToken, ports, pid};
+        return {
+            csrfToken: info.csrfToken,
+            ports: [info.port],
+            pid: info.pid,
+            source: info.source || 'cli_daemon',
+        };
     } catch (e) {
         console.error(`[AntigravityTracker] Discovery error: ${e.message}`);
         return null;
@@ -169,6 +185,7 @@ export default class AntigravityTrackerExtension extends Extension {
         this._quotaData = null;
         this._timerId = 0;
         this._discoveryTimerId = 0;
+        this._isDiscovering = false;
         this._groupWidgets = [];
 
         // Panel button with custom gauge icon
@@ -194,8 +211,8 @@ export default class AntigravityTrackerExtension extends Extension {
             }
         );
 
-        // Kick off initial server discovery
-        this._startDiscovery();
+        // Kick off initial server discovery (with auto-start enabled)
+        this._startDiscovery(true);
     }
 
     disable() {
@@ -234,8 +251,11 @@ export default class AntigravityTrackerExtension extends Extension {
         this._quotaSection = null;
         this._refreshItem = null;
         this._refreshLabel = null;
+        this._sourceLabel = null;
         this._lastUpdateLabel = null;
-        this._launchItem = null;
+        this._startDaemonItem = null;
+        this._stopDaemonItem = null;
+        this._launchAppItem = null;
     }
 
     // ── Menu Construction ────────────────────────────────────────────────
@@ -257,32 +277,53 @@ export default class AntigravityTrackerExtension extends Extension {
         this._statusItem.add_child(this._statusLabel);
         menu.addMenuItem(this._statusItem);
 
-        // "Launch Antigravity" action (visible when server not found)
-        this._launchItem = new PopupMenu.PopupBaseMenuItem({
+        // "Start CLI Daemon" action (visible when disconnected)
+        this._startDaemonItem = new PopupMenu.PopupBaseMenuItem({
             reactive: true,
             can_focus: true,
         });
-        this._launchItem.add_style_class_name('agt-launch-item');
-        const launchBox = new St.BoxLayout({
+        this._startDaemonItem.add_style_class_name('agt-launch-item');
+        const daemonBox = new St.BoxLayout({
             x_expand: true,
             x_align: Clutter.ActorAlign.CENTER,
         });
-        const launchIcon = new St.Label({text: '🚀'});
-        launchIcon.set_style('margin-right: 8px;');
-        launchBox.add_child(launchIcon);
-        const launchLabel = new St.Label({text: 'Launch Antigravity'});
-        launchLabel.add_style_class_name('agt-launch-label');
-        launchBox.add_child(launchLabel);
-        this._launchItem.add_child(launchBox);
-        this._launchItem.connect('activate', () => this._launchAntigravity());
-        this._launchItem.visible = false;
-        menu.addMenuItem(this._launchItem);
+        const daemonIcon = new St.Label({text: '▶'});
+        daemonIcon.set_style('margin-right: 8px;');
+        daemonBox.add_child(daemonIcon);
+        const daemonLabel = new St.Label({text: 'Start Antigravity Daemon'});
+        daemonLabel.add_style_class_name('agt-launch-label');
+        daemonBox.add_child(daemonLabel);
+        this._startDaemonItem.add_child(daemonBox);
+        this._startDaemonItem.connect('activate', () => this._startDaemon());
+        this._startDaemonItem.visible = false;
+        menu.addMenuItem(this._startDaemonItem);
+
+        // "Launch Desktop App" action (optional secondary launcher)
+        this._launchAppItem = new PopupMenu.PopupBaseMenuItem({
+            reactive: true,
+            can_focus: true,
+        });
+        this._launchAppItem.add_style_class_name('agt-launch-item');
+        const appBox = new St.BoxLayout({
+            x_expand: true,
+            x_align: Clutter.ActorAlign.CENTER,
+        });
+        const appIcon = new St.Label({text: '🚀'});
+        appIcon.set_style('margin-right: 8px;');
+        appBox.add_child(appIcon);
+        const appLabel = new St.Label({text: 'Launch Desktop App'});
+        appLabel.add_style_class_name('agt-launch-label');
+        appBox.add_child(appLabel);
+        this._launchAppItem.add_child(appBox);
+        this._launchAppItem.connect('activate', () => this._launchAntigravity());
+        this._launchAppItem.visible = false;
+        menu.addMenuItem(this._launchAppItem);
 
         // Scrollable section for quota groups
         this._quotaSection = new PopupMenu.PopupMenuSection();
         menu.addMenuItem(this._quotaSection);
 
-        // ── Bottom bar: Refresh + timestamp ──
+        // ── Bottom bar: Refresh + source indicator + timestamp ──
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._refreshItem = new PopupMenu.PopupBaseMenuItem({
@@ -298,6 +339,11 @@ export default class AntigravityTrackerExtension extends Extension {
         });
         this._refreshLabel.add_style_class_name('agt-refresh-label');
         refreshBox.add_child(this._refreshLabel);
+
+        this._sourceLabel = new St.Label({text: ''});
+        this._sourceLabel.add_style_class_name('agt-source-label');
+        this._sourceLabel.set_style('margin-right: 12px;');
+        refreshBox.add_child(this._sourceLabel);
 
         this._lastUpdateLabel = new St.Label({text: ''});
         this._lastUpdateLabel.add_style_class_name('agt-last-update');
@@ -316,6 +362,23 @@ export default class AntigravityTrackerExtension extends Extension {
         };
 
         menu.addMenuItem(this._refreshItem);
+
+        // "Stop Daemon" action item (visible when connected to CLI daemon)
+        this._stopDaemonItem = new PopupMenu.PopupBaseMenuItem({
+            reactive: true,
+            can_focus: true,
+        });
+        const stopBox = new St.BoxLayout({
+            x_expand: true,
+            x_align: Clutter.ActorAlign.CENTER,
+        });
+        const stopLabel = new St.Label({text: '⏹  Stop Antigravity Daemon'});
+        stopLabel.add_style_class_name('agt-stop-label');
+        stopBox.add_child(stopLabel);
+        this._stopDaemonItem.add_child(stopBox);
+        this._stopDaemonItem.connect('activate', () => this._stopDaemon());
+        this._stopDaemonItem.visible = false;
+        menu.addMenuItem(this._stopDaemonItem);
     }
 
     /**
@@ -328,12 +391,11 @@ export default class AntigravityTrackerExtension extends Extension {
 
         if (!data?.groups?.length) {
             this._statusLabel.text = 'No quota data available';
-            this._statusItem.visible = true;
+            this._updateMenuState();
             return;
         }
 
-        this._statusItem.visible = false;
-        this._launchItem.visible = false;
+        this._updateMenuState();
 
         for (let gi = 0; gi < data.groups.length; gi++) {
             const group = data.groups[gi];
@@ -485,24 +547,63 @@ export default class AntigravityTrackerExtension extends Extension {
 
     // ── Server Discovery & Connection ────────────────────────────────────
 
-    async _startDiscovery() {
-        this._serverInfo = discoverServer();
+    _updateMenuState() {
+        const isConnected = !!(this._serverInfo && this._activePort);
+        const isCli = this._serverInfo?.source === 'cli_daemon';
 
-        if (this._serverInfo) {
-            const port = await this._probeConnectPort();
-            if (port) {
-                this._activePort = port;
-                await this._fetchQuota();
-                this._startPolling();
-                return;
+        if (this._statusItem)
+            this._statusItem.visible = !isConnected;
+
+        if (this._startDaemonItem)
+            this._startDaemonItem.visible = !isConnected;
+
+        if (this._launchAppItem)
+            this._launchAppItem.visible = !isConnected && !!this._findAntigravityBinary();
+
+        if (this._stopDaemonItem)
+            this._stopDaemonItem.visible = isConnected && isCli;
+
+        if (this._sourceLabel) {
+            if (isConnected) {
+                this._sourceLabel.text = isCli ? 'CLI Daemon' : 'Desktop App';
+                this._sourceLabel.visible = true;
+            } else {
+                this._sourceLabel.visible = false;
             }
         }
+    }
 
-        // Server not found — show status and offer to launch
-        this._statusLabel.text = 'Antigravity not running';
-        this._statusItem.visible = true;
-        this._launchItem.visible = !!this._findAntigravityBinary();
-        this._scheduleDiscoveryRetry();
+    async _startDiscovery(autostart = true) {
+        if (this._isDiscovering) return;
+        this._isDiscovering = true;
+
+        try {
+            const args = autostart ? ['--autostart'] : ['--no-autostart'];
+            this._serverInfo = await discoverServerAsync(this.path, args, this._cancellable);
+
+            if (this._serverInfo) {
+                const port = await this._probeConnectPort();
+                if (port) {
+                    this._activePort = port;
+                    await this._fetchQuota();
+                    this._startPolling();
+                    this._updateMenuState();
+                    return;
+                }
+            }
+
+            // Server not found
+            this._statusLabel.text = 'Antigravity not running';
+            this._updateMenuState();
+            this._scheduleDiscoveryRetry();
+        } catch (e) {
+            console.error(`[AntigravityTracker] Discovery error: ${e.message}`);
+            this._statusLabel.text = 'Discovery failed';
+            this._updateMenuState();
+            this._scheduleDiscoveryRetry();
+        } finally {
+            this._isDiscovering = false;
+        }
     }
 
     _scheduleDiscoveryRetry() {
@@ -510,10 +611,50 @@ export default class AntigravityTrackerExtension extends Extension {
         this._discoveryTimerId = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT, DISCOVERY_RETRY_INTERVAL, () => {
                 this._discoveryTimerId = 0;
-                this._startDiscovery();
+                this._startDiscovery(true);
                 return GLib.SOURCE_REMOVE;
             }
         );
+    }
+
+    /**
+     * Start the CLI background daemon and discover it.
+     */
+    async _startDaemon() {
+        this._statusLabel.text = 'Starting CLI daemon…';
+        this._statusItem.visible = true;
+        this._startDaemonItem.visible = false;
+        if (this._launchAppItem) this._launchAppItem.visible = false;
+
+        const info = await discoverServerAsync(this.path, ['--start'], this._cancellable);
+        if (info && info.ports?.length) {
+            this._serverInfo = info;
+            this._activePort = info.ports[0];
+            await this._fetchQuota();
+            this._startPolling();
+        } else {
+            this._statusLabel.text = 'Failed to start CLI daemon';
+        }
+        this._updateMenuState();
+    }
+
+    /**
+     * Stop the running CLI background daemon.
+     */
+    async _stopDaemon() {
+        this._stopPolling();
+        this._serverInfo = null;
+        this._activePort = null;
+        this._quotaData = null;
+        this._quotaSection.removeAll();
+
+        this._statusLabel.text = 'Stopping CLI daemon…';
+        this._statusItem.visible = true;
+        this._updateMenuState();
+
+        await discoverServerAsync(this.path, ['--stop'], this._cancellable);
+        this._statusLabel.text = 'CLI daemon stopped';
+        this._updateMenuState();
     }
 
     /**
@@ -577,7 +718,7 @@ export default class AntigravityTrackerExtension extends Extension {
 
     async _fetchQuota() {
         if (!this._serverInfo || !this._activePort) {
-            this._startDiscovery();
+            this._startDiscovery(true);
             return;
         }
 
@@ -590,6 +731,7 @@ export default class AntigravityTrackerExtension extends Extension {
             const now = new Date();
             this._lastUpdateLabel.text =
                 `Last: ${now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
+            this._updateMenuState();
 
         } catch (e) {
             if (this._cancellable?.is_cancelled()) return;
@@ -601,8 +743,7 @@ export default class AntigravityTrackerExtension extends Extension {
             this._serverInfo = null;
             this._stopPolling();
             this._statusLabel.text = 'Connection lost — retrying…';
-            this._statusItem.visible = true;
-            this._launchItem.visible = !!this._findAntigravityBinary();
+            this._updateMenuState();
             this._scheduleDiscoveryRetry();
         }
     }
@@ -624,7 +765,6 @@ export default class AntigravityTrackerExtension extends Extension {
             '/opt/antigravity/antigravity',
         ];
 
-        // Also check PATH
         const inPath = GLib.find_program_in_path('antigravity');
         if (inPath) candidates.unshift(inPath);
 
@@ -637,7 +777,6 @@ export default class AntigravityTrackerExtension extends Extension {
 
     /**
      * Launch the Antigravity desktop app in the background.
-     * After launch, schedule a discovery attempt to pick up the new server.
      */
     _launchAntigravity() {
         const binary = this._findAntigravityBinary();
@@ -649,11 +788,11 @@ export default class AntigravityTrackerExtension extends Extension {
         try {
             GLib.spawn_command_line_async(binary);
             this._statusLabel.text = 'Launching Antigravity…';
-            this._launchItem.visible = false;
+            this._startDaemonItem.visible = false;
+            this._launchAppItem.visible = false;
 
-            // Give the app time to start its language server, then re-discover
             GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 8, () => {
-                this._startDiscovery();
+                this._startDiscovery(false);
                 return GLib.SOURCE_REMOVE;
             });
         } catch (e) {

@@ -89,7 +89,18 @@
     font-size: 10pt;
 }
 
+.agt-source-label {
+    color: #81c784;
+    font-size: 8.5pt;
+    font-weight: bold;
+}
+
 .agt-last-update {
     color: #666666;
     font-size: 9pt;
+}
+
+.agt-stop-label {
+    color: #e57373;
+    font-size: 9.5pt;
 }
