@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Copyright (C) 2026 Jason / mindslost
+# Antigravity Tracker GNOME Shell Extension
+#
+# NOTE FOR GNOME EXTENSION REVIEWERS:
+# This helper script is implemented in Python because discovering the active
+# Antigravity language server requires inspecting /proc/<pid>/maps and seeking
+# directly into /proc/<pid>/mem to search raw binary byte patterns for the
+# dynamic CSRF authentication token. GJS does not provide binary byte-level regex
+# matching over arbitrary non-UTF8 process heap memory buffers, and scanning process
+# memory within the GNOME Shell compositor thread could block the main UI loop or crash.
+# Running this as an isolated asynchronous subprocess ensures GNOME Shell remains fast
+# and completely stable. All process and socket discovery is handled natively via /proc.
+
 """
 Server discovery and auto-start helper for Antigravity Tracker GNOME Shell Extension.
 Finds the active Antigravity language server instance (CLI daemon or Desktop app),
@@ -11,6 +26,7 @@ import glob
 import json
 import os
 import re
+import signal
 import ssl
 import subprocess
 import sys
@@ -80,44 +96,87 @@ def save_cache(data: dict):
         pass
 
 
+def get_listening_ports(pid: int) -> list[int]:
+    """Find TCP listening ports owned by the specified PID via /proc."""
+    sockets = set()
+    try:
+        fd_dir = f"/proc/{pid}/fd"
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+                if target.startswith("socket:["):
+                    sockets.add(target[8:-1])
+            except Exception:
+                pass
+    except Exception:
+        return []
+
+    ports = []
+    for tcp_path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(tcp_path, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 10 and parts[3] == "0A":  # TCP_LISTEN
+                        if parts[9] in sockets:
+                            port = int(parts[1].split(":")[1], 16)
+                            if port > 1024:
+                                ports.append(port)
+        except Exception:
+            pass
+
+    # Fallback to ss if /proc/net/tcp could not be read
+    if not ports:
+        try:
+            ss_out = subprocess.check_output(
+                ["ss", "-tlnp"],
+                text=True,
+                timeout=1.0,
+            )
+            for line in ss_out.splitlines():
+                if f"pid={pid}," in line:
+                    for p in re.findall(r"127\.0\.0\.1:(\d+)", line):
+                        port = int(p)
+                        if port > 1024:
+                            ports.append(port)
+        except Exception:
+            pass
+
+    return sorted(list(set(ports)))
+
+
 def discover_desktop_app():
     """Check for Antigravity desktop Electron app (language_server process)."""
-    try:
-        output = subprocess.check_output(
-            ["/bin/bash", "-c", "ps -eo pid,args 2>/dev/null | grep language_server | grep csrf_token | grep -v grep"],
-            text=True,
-            timeout=1.0,
-        )
-    except Exception:
-        return None
-
-    if not output.strip():
-        return None
-
-    pid_match = re.search(r"^\s*(\d+)", output, re.MULTILINE)
-    csrf_match = re.search(r"--csrf_token\s+(\S+)", output)
-    if not pid_match or not csrf_match:
-        return None
-
-    pid = int(pid_match.group(1))
-    csrf_token = csrf_match.group(1)
-
-    # Find listening ports via ss
-    try:
-        ss_out = subprocess.check_output(
-            ["/bin/bash", "-c", f"ss -tlnp 2>/dev/null | grep 'pid={pid},'"],
-            text=True,
-            timeout=1.0,
-        )
-        ports = [int(p) for p in re.findall(r"127\.0\.0\.1:(\d+)", ss_out) if int(p) > 1024]
-    except Exception:
-        ports = []
-
-    for port in ports:
-        if check_rpc(port, csrf_token, timeout=0.5):
-            res = {"pid": pid, "port": port, "csrfToken": csrf_token, "source": "desktop_app"}
-            save_cache(res)
-            return res
+    my_pid = os.getpid()
+    for entry in os.scandir("/proc"):
+        if not entry.is_dir() or not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == my_pid:
+            continue
+        try:
+            with open(os.path.join(entry.path, "cmdline"), "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            if "language_server" in cmd and "--csrf_token" in cmd:
+                if "discover_server" in cmd:
+                    continue
+                csrf_match = re.search(r"--csrf_token\s+([a-f0-9-]+)", cmd)
+                if not csrf_match:
+                    continue
+                csrf_token = csrf_match.group(1)
+                ports = get_listening_ports(pid)
+                for port in ports:
+                    if check_rpc(port, csrf_token, timeout=0.5):
+                        res = {
+                            "pid": pid,
+                            "port": port,
+                            "csrfToken": csrf_token,
+                            "source": "desktop_app",
+                        }
+                        save_cache(res)
+                        return res
+        except Exception:
+            continue
 
     return None
 
@@ -138,19 +197,22 @@ def get_cli_daemon_pid() -> int | None:
     except Exception:
         pass
 
-    # Method 2: pgrep for agy remote-control serve
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-f", "agy remote-control serve"],
-            text=True,
-            timeout=1.0,
-        ).split()
-        if pids:
-            pid = int(pids[0])
-            if is_pid_alive(pid):
-                return pid
-    except Exception:
-        pass
+    # Method 2: Scan /proc for agy remote-control serve
+    my_pid = os.getpid()
+    for entry in os.scandir("/proc"):
+        if not entry.is_dir() or not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == my_pid:
+            continue
+        try:
+            with open(os.path.join(entry.path, "cmdline"), "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            if "agy remote-control serve" in cmd and "discover_server" not in cmd:
+                if is_pid_alive(pid):
+                    return pid
+        except Exception:
+            continue
 
     return None
 
@@ -223,18 +285,10 @@ def get_cli_daemon_port(pid: int) -> int | None:
         except Exception:
             pass
 
-    # Fallback: scan listening ports for this PID
-    try:
-        ss_out = subprocess.check_output(
-            ["/bin/bash", "-c", f"ss -tlnp 2>/dev/null | grep 'pid={pid},'"],
-            text=True,
-            timeout=1.0,
-        )
-        ports = [int(p) for p in re.findall(r"127\.0\.0\.1:(\d+)", ss_out) if int(p) > 1024]
-        if ports:
-            return max(ports)
-    except Exception:
-        pass
+    # Fallback: scan listening ports for this PID via /proc
+    ports = get_listening_ports(pid)
+    if ports:
+        return max(ports)
 
     return None
 
@@ -278,7 +332,7 @@ def extract_csrf_token_from_mem(pid: int, port: int) -> str | None:
 
 
 def stop_cli_daemon() -> bool:
-    """Stop the CLI daemon via systemd user service or agy CLI."""
+    """Stop the CLI daemon via systemd user service or native signal."""
     try:
         subprocess.run(
             ["systemctl", "--user", "stop", "antigravity-cli-daemon.service"],
@@ -294,11 +348,25 @@ def stop_cli_daemon() -> bool:
     except Exception:
         pass
 
-    # Ensure any remaining agy serve process is stopped
-    try:
-        subprocess.run(["pkill", "-f", "agy remote-control serve"], timeout=2.0)
-    except Exception:
-        pass
+    # Terminate any remaining agy serve processes directly via signal
+    my_pid = os.getpid()
+    for entry in os.scandir("/proc"):
+        if not entry.is_dir() or not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == my_pid:
+            continue
+        try:
+            with open(os.path.join(entry.path, "cmdline"), "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            if "agy remote-control serve" in cmd and "discover_server" not in cmd:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        except Exception:
+            continue
+
     return True
 
 

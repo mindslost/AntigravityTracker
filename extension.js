@@ -1,11 +1,14 @@
 /* ──────────────────────────────────────────────────────────────────────────────
  * Antigravity Tracker — GNOME Shell Extension
  *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 Jason / mindslost
+ *
  * Displays Antigravity AI usage quotas in the top bar. Auto-discovers the
  * local language server, fetches quota data via Connect-RPC, and renders
  * circular progress rings for each model group.
  *
- * Target: GNOME Shell 48–50 (ESM modules, Soup 3.0, Wayland-only)
+ * Target: GNOME Shell 45–50 (ESM modules, Soup 3.0, Wayland-ready)
  * ────────────────────────────────────────────────────────────────────────── */
 
 import Cairo from 'cairo';
@@ -130,11 +133,19 @@ function runCommandAsync(argv, cancellable = null) {
                         success: ok && p.get_successful(),
                     });
                 } catch (err) {
-                    reject(err);
+                    if (cancellable?.is_cancelled() || err.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+                        resolve({stdout: '', stderr: '', success: false, cancelled: true});
+                    } else {
+                        reject(err);
+                    }
                 }
             });
         } catch (e) {
-            reject(e);
+            if (cancellable?.is_cancelled() || e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+                resolve({stdout: '', stderr: '', success: false, cancelled: true});
+            } else {
+                reject(e);
+            }
         }
     });
 }
@@ -151,7 +162,7 @@ async function discoverServerAsync(extensionPath, extraArgs = [], cancellable = 
     try {
         const scriptPath = GLib.build_filenamev([extensionPath, 'discover_server.py']);
         const res = await runCommandAsync(['/usr/bin/python3', scriptPath, ...extraArgs], cancellable);
-        if (!res.success) return null;
+        if (!res.success || res.cancelled || cancellable?.is_cancelled()) return null;
 
         const text = res.stdout.trim();
         if (!text || text === 'null') return null;
@@ -166,7 +177,9 @@ async function discoverServerAsync(extensionPath, extraArgs = [], cancellable = 
             source: info.source || 'cli_daemon',
         };
     } catch (e) {
-        console.error(`[AntigravityTracker] Discovery error: ${e.message}`);
+        if (!cancellable?.is_cancelled()) {
+            console.error(`[AntigravityTracker] Discovery error: ${e.message}`);
+        }
         return null;
     }
 }
@@ -185,6 +198,7 @@ export default class AntigravityTrackerExtension extends Extension {
         this._quotaData = null;
         this._timerId = 0;
         this._discoveryTimerId = 0;
+        this._launchTimerId = 0;
         this._isDiscovering = false;
         this._groupWidgets = [];
 
@@ -221,6 +235,11 @@ export default class AntigravityTrackerExtension extends Extension {
         if (this._discoveryTimerId) {
             GLib.source_remove(this._discoveryTimerId);
             this._discoveryTimerId = 0;
+        }
+
+        if (this._launchTimerId) {
+            GLib.source_remove(this._launchTimerId);
+            this._launchTimerId = 0;
         }
 
         if (this._cancellable) {
@@ -575,17 +594,21 @@ export default class AntigravityTrackerExtension extends Extension {
 
     async _startDiscovery(autostart = true) {
         if (this._isDiscovering) return;
+        if (this._cancellable?.is_cancelled()) return;
         this._isDiscovering = true;
 
         try {
             const args = autostart ? ['--autostart'] : ['--no-autostart'];
             this._serverInfo = await discoverServerAsync(this.path, args, this._cancellable);
+            if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
 
             if (this._serverInfo) {
                 const port = await this._probeConnectPort();
+                if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
                 if (port) {
                     this._activePort = port;
                     await this._fetchQuota();
+                    if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
                     this._startPolling();
                     this._updateMenuState();
                     return;
@@ -597,9 +620,12 @@ export default class AntigravityTrackerExtension extends Extension {
             this._updateMenuState();
             this._scheduleDiscoveryRetry();
         } catch (e) {
+            if (this._cancellable?.is_cancelled()) return;
             console.error(`[AntigravityTracker] Discovery error: ${e.message}`);
-            this._statusLabel.text = 'Discovery failed';
-            this._updateMenuState();
+            if (this._statusLabel) {
+                this._statusLabel.text = 'Discovery failed';
+                this._updateMenuState();
+            }
             this._scheduleDiscoveryRetry();
         } finally {
             this._isDiscovering = false;
@@ -607,11 +633,13 @@ export default class AntigravityTrackerExtension extends Extension {
     }
 
     _scheduleDiscoveryRetry() {
-        if (this._discoveryTimerId) return;
+        if (this._discoveryTimerId || this._cancellable?.is_cancelled()) return;
         this._discoveryTimerId = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT, DISCOVERY_RETRY_INTERVAL, () => {
                 this._discoveryTimerId = 0;
-                this._startDiscovery(true);
+                if (!this._cancellable?.is_cancelled()) {
+                    this._startDiscovery(true);
+                }
                 return GLib.SOURCE_REMOVE;
             }
         );
@@ -621,16 +649,20 @@ export default class AntigravityTrackerExtension extends Extension {
      * Start the CLI background daemon and discover it.
      */
     async _startDaemon() {
+        if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
         this._statusLabel.text = 'Starting CLI daemon…';
         this._statusItem.visible = true;
         this._startDaemonItem.visible = false;
         if (this._launchAppItem) this._launchAppItem.visible = false;
 
         const info = await discoverServerAsync(this.path, ['--start'], this._cancellable);
+        if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
+
         if (info && info.ports?.length) {
             this._serverInfo = info;
             this._activePort = info.ports[0];
             await this._fetchQuota();
+            if (this._cancellable?.is_cancelled()) return;
             this._startPolling();
         } else {
             this._statusLabel.text = 'Failed to start CLI daemon';
@@ -646,13 +678,15 @@ export default class AntigravityTrackerExtension extends Extension {
         this._serverInfo = null;
         this._activePort = null;
         this._quotaData = null;
-        this._quotaSection.removeAll();
+        if (this._quotaSection) this._quotaSection.removeAll();
 
+        if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
         this._statusLabel.text = 'Stopping CLI daemon…';
         this._statusItem.visible = true;
         this._updateMenuState();
 
         await discoverServerAsync(this.path, ['--stop'], this._cancellable);
+        if (this._cancellable?.is_cancelled() || !this._statusLabel) return;
         this._statusLabel.text = 'CLI daemon stopped';
         this._updateMenuState();
     }
@@ -786,13 +820,26 @@ export default class AntigravityTrackerExtension extends Extension {
         }
 
         try {
-            GLib.spawn_command_line_async(binary);
+            const proc = new Gio.Subprocess({
+                argv: [binary],
+                flags: Gio.SubprocessFlags.NONE,
+            });
+            proc.init(null);
+
             this._statusLabel.text = 'Launching Antigravity…';
             this._startDaemonItem.visible = false;
             this._launchAppItem.visible = false;
 
-            GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 8, () => {
-                this._startDiscovery(false);
+            if (this._launchTimerId) {
+                GLib.source_remove(this._launchTimerId);
+                this._launchTimerId = 0;
+            }
+
+            this._launchTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 8, () => {
+                this._launchTimerId = 0;
+                if (!this._cancellable?.is_cancelled()) {
+                    this._startDiscovery(false);
+                }
                 return GLib.SOURCE_REMOVE;
             });
         } catch (e) {

@@ -3,10 +3,13 @@
   "name": "Antigravity Tracker",
   "description": "Displays Antigravity AI usage quotas (Gemini, Claude, GPT) in the GNOME Shell top bar with circular progress indicators.",
   "shell-version": [
+    "45",
+    "46",
+    "47",
     "48",
     "49",
     "50"
   ],
-  "url": "https://github.com/mindslost/antigravity-tracker",
+  "url": "https://github.com/mindslost/AntigravityTracker",
   "version": 1
 }
